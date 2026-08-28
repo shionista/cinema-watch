@@ -41,7 +41,8 @@ TICKETING_URL = "https://www.lottecinema.co.kr/NLCHS/Ticketing"
 DEFAULT_SETTINGS = {
     "banner": True,        # 시작 화면 브랜드 로고(ASCII 배너) 표시
     "banner_hold": 3.0,    # 정보성 배너를 몇 초 보여줄지
-    "sound": True,         # 알림 소리(비프) 전역 스위치
+    "sound": True,         # 알림 소리 전역 스위치
+    "sound_file": "",      # 알림음 WAV 파일명 (Windows Media 폴더 기준, 빈 값=기본)
 }
 SETTINGS: dict = dict(DEFAULT_SETTINGS)
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
@@ -1449,11 +1450,12 @@ class CgvProvider(Provider):
     title = "CGV WATCH"
     site = "cgv.co.kr"
     supports_seats = False
-    supports_shows = False
-    note = "지점 목록만 (상영표 API 미확보)"
+    supports_shows = True
+    note = "상영표·잔여석까지 (좌석표는 미제공)"
 
     BASE = "https://cgv.co.kr"
     CO = "A420"
+    RTCTL = "1"          # 발매통제범위코드. 1 이어야 조회가 열린다(실측).
 
     def __init__(self):
         self.http = WebJson()
@@ -1485,8 +1487,36 @@ class CgvProvider(Provider):
         return out
 
     def showtimes(self, cinema: Cinema, play_date: str) -> list[Show]:
-        raise Unsupported(
-            "CGV 는 2026년 사이트 개편으로 공개 상영표 API 를 아직 확보하지 못했습니다.")
+        """상영표. `searchMovScnInfo` 한 번이면 그 극장·그 날짜 전 회차가 온다.
+
+        신규 SPA 의 JS 번들에서 엔드포인트를 확보했다. 호스트는 api.cgv.co.kr 이지만
+        직접 호출하면 401 이고, cgv.co.kr/api/v1/booking/ 프록시로는 열린다.
+        잔여석은 `frSeatCnt`, 총석은 `stcnt`(= cpSeatCnt).
+        """
+        site = cinema.key or str(cinema.cinema_id)
+        ymd = play_date.replace("-", "")
+        data = self.http.request(
+            f"{self.BASE}/api/v1/booking/searchMovScnInfo?coCd={self.CO}"
+            f"&siteNo={site}&scnYmd={ymd}&rtctlScopCd={self.RTCTL}",
+            referer=f"{self.BASE}/cnm/movieBook")
+        out = []
+        for r in data.get("data") or []:
+            out.append(Show(
+                cinema_id=str(r.get("siteNo") or site),
+                cinema_name=str(r.get("siteNm") or cinema.name),
+                movie_name=str(r.get("movNm") or r.get("expoProdNm") or "").strip(),
+                movie_code=str(r.get("movNo") or ""),
+                screen_id=str(r.get("scnsNo") or ""),
+                screen_name=str(r.get("expoScnsNm") or r.get("scnsNm") or "").strip(),
+                play_date=fmt_date(str(r.get("scnYmd") or ymd)),
+                play_seq=str(r.get("scnSseq") or ""),
+                start=fmt_hhmm(str(r.get("scnsrtTm") or "")),
+                end=fmt_hhmm(str(r.get("scnendTm") or "")),
+                total_seats=int(r.get("stcnt") or r.get("cpSeatCnt") or 0),
+                open_seats=int(r.get("frSeatCnt") or 0),
+                film=str(r.get("movkndDsplNm") or ""),
+                bookable=str(r.get("cntlYn") or "N").upper() != "Y"))
+        return out
 
 
 def unescape_html(text: str) -> str:
@@ -1499,6 +1529,14 @@ def fmt_date(compact: str) -> str:
     """'20260830' -> '2026-08-30'"""
     if len(compact) == 8 and compact.isdigit():
         return f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
+    return compact
+
+
+def fmt_hhmm(compact: str) -> str:
+    """'1350' -> '13:50' (CGV 는 시각을 4자리 숫자로 준다)"""
+    compact = compact.strip()
+    if len(compact) == 4 and compact.isdigit():
+        return f"{compact[:2]}:{compact[2:]}"
     return compact
 
 
@@ -1925,9 +1963,13 @@ class Scheduler:
 
     @staticmethod
     def show_dt(show: Show) -> datetime:
+        # CGV 는 심야 회차를 24:40 처럼 24시 이상으로 준다. strptime 은 이걸 못 읽으니
+        # 날짜에 timedelta 를 더해 다음날로 넘긴다 (00:40 이 되어 임박 판정이 맞아진다).
         try:
-            return datetime.strptime(f"{show.play_date} {show.start}", "%Y-%m-%d %H:%M")
-        except ValueError:
+            hh, mm = show.start.split(":")
+            return (datetime.strptime(show.play_date, "%Y-%m-%d")
+                    + timedelta(hours=int(hh), minutes=int(mm)))
+        except (ValueError, AttributeError):
             return datetime.max
 
     def tier(self, show: Show, now: datetime | None = None) -> str:
@@ -2386,6 +2428,112 @@ def wizard_seat(cat: Catalog, fav: Favorites) -> Watch:
 
     wiz_notify(cfg, crumbs)
     return cfg
+
+
+def browse_seats(cat: Catalog, fav: Favorites) -> None:
+    """감시를 걸지 않고 회차 하나를 골라 좌석표(또는 잔여석)를 바로 본다.
+
+    좌석표를 제공하는 브랜드(롯데·메가박스)는 좌석 배치를 그리고,
+    상영표만 되는 브랜드(CGV)는 회차별 잔여석을 보여준다.
+    """
+    brand = cat.provider
+    crumbs = ["좌석 확인"]
+    cinema = wiz_cinema(cat, crumbs, fav)
+    crumbs = crumbs + [cinema.name]
+
+    # 날짜 고르기 (오늘부터 14일)
+    today = date.today()
+    days = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(14)]
+
+    def day_label(d: str) -> str:
+        dt = datetime.strptime(d, "%Y-%m-%d")
+        delta = (dt.date() - today).days
+        when = "오늘" if delta == 0 else ("내일" if delta == 1 else f"D+{delta}")
+        return two_col(f"{d[5:]} ({WEEKDAY_KR[dt.weekday()]})", when, right_width=10)
+
+    while True:
+        day = Chooser("날짜 선택", days, day_label, crumbs).run()
+
+        clear_screen()
+        print("\n".join(header(f"{cinema.name} {day[5:]} 상영표", crumbs)))
+        print(box_bottom())
+        try:
+            shows = cat.merge_rows(cat.shows(cinema, day))
+        except (LotteApiError, Unsupported) as exc:
+            print(f"   {C.BRED}상영표를 불러오지 못했습니다: {exc}{C.RESET}")
+            read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
+            return
+        if not shows:
+            print(f"   {C.YELLOW}이 날짜에는 상영 정보가 없습니다."
+                  f" (아직 예매가 열리지 않았을 수 있습니다){C.RESET}")
+            read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
+            continue
+
+        shows.sort(key=lambda s: (s.start, s.screen_name))
+
+        def show_label(s: Show) -> str:
+            if s.total_seats:
+                ratio = s.open_seats / s.total_seats
+                color = (C.BRED if ratio <= 0.05 else
+                         C.BYELLOW if ratio <= 0.3 else C.BGREEN)
+            else:
+                color = C.DIM
+            left = f"{s.start} {trim(s.movie_name, 22)}"
+            right = (f"{trim(s.screen_name, 16)} "
+                     f"{color}{s.open_seats:>3}{C.RESET}{C.DIM}/{s.total_seats}{C.RESET}")
+            return f"{cell(left, 34)}{right}"
+
+        picked = Chooser(f"{day[5:]} 회차 선택 ({len(shows)}개)", shows, show_label,
+                         crumbs + [day[5:]],
+                         hint="Enter 로 좌석을 봅니다 · / 로 영화 검색").run()
+        view_one_show(cat, picked, crumbs + [day[5:]])
+        if not ask_yes("다른 회차를 더 볼까요?", True):
+            return
+
+
+def view_one_show(cat: Catalog, show: Show, crumbs: list[str]) -> None:
+    """회차 하나의 좌석표를 그린다. r 로 새로고침."""
+    brand = cat.provider
+    while True:
+        clear_screen()
+        lines = header(f"{show.movie_name}", crumbs)
+        lines.append(box_row(f"{C.DIM}{pad('일시', 8)}{C.RESET}{C.BWHITE}"
+                             f"{show.play_date} {show.start}~{show.end}{C.RESET}"))
+        lines.append(box_row(f"{C.DIM}{pad('상영관', 8)}{C.RESET}{C.BWHITE}"
+                             f"{show.screen_name}{C.RESET}"
+                             f"{C.DIM}  {show.film}{C.RESET}"))
+        lines.append(box_row(f"{C.DIM}{pad('잔여석', 8)}{C.RESET}"
+                             f"{C.BGREEN}{show.open_seats}{C.RESET}"
+                             f"{C.DIM} / {show.total_seats}석{C.RESET}"))
+        lines.append(box_mid())
+        print("\n".join(lines))
+
+        if not brand.supports_seats:
+            print(box_row(f"{C.DIM}{brand.name} 는 좌석표를 제공하지 않아"
+                          f" 잔여석까지만 확인됩니다.{C.RESET}"))
+            print(box_bottom())
+            read_line(f"   {C.DIM}Enter 로 돌아가기{C.RESET}")
+            return
+
+        print(box_bottom())
+        try:
+            smap = cat.seats(show)
+        except (LotteApiError, Unsupported) as exc:
+            print(f"   {C.BRED}좌석표를 불러오지 못했습니다: {exc}{C.RESET}")
+            read_line(f"   {C.DIM}Enter 로 돌아가기{C.RESET}")
+            return
+
+        sweet = sweet_seats(smap, 0.2) if smap.coord else set()
+        print()
+        print("\n".join(seatmap_lines(smap, sweet)))
+        print(f"\n{C.DIM}   스크린 방향은 위쪽입니다. 통로는 빈칸.{C.RESET}")
+        if smap.total and smap.total != show.total_seats:
+            print(f"{C.DIM}   상영표 총석 {show.total_seats} · 좌석표 {smap.total}"
+                  f"{C.RESET}")
+        print(keyhint(("r", "새로고침"), ("Enter", "돌아가기")))
+        key = read_key() if UI["tty"] else "enter"
+        if key not in ("r", "R"):
+            return
 
 
 def wizard_open(cat: Catalog, fav: Favorites) -> Watch:
@@ -3134,22 +3282,37 @@ def run_brand(provider: Provider) -> None:
             continue
 
 
-def play_alert_sound() -> None:
-    """알림용 비프음.
+SOUND_CHOICES = [("Alarm01.wav", "알람 (기본)"), ("Ring01.wav", "벨소리"),
+                 ("Windows Notify.wav", "알림음"), ("chimes.wav", "차임")]
 
-    Windows 의 winsound.Beep 은 '메인보드 비프 스피커' 로 소리를 내는데,
-    요즘 PC·노트북엔 그 스피커가 없어서 사운드카드로는 아무 소리도 안 나는
-    경우가 흔하다. 그래서 사운드카드로 확실히 울리는 MessageBeep(시스템
-    알림음)을 항상 함께 낸다. 그 외 OS 는 터미널 벨(\\a).
+
+def sound_path(name: str = "") -> str:
+    """Windows Media 폴더의 알림음 경로. 없으면 빈 문자열."""
+    if os.name != "nt":
+        return ""
+    media = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Media")
+    for cand in ([name] if name else []) + [n for n, _ in SOUND_CHOICES]:
+        path = os.path.join(media, cand)
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def play_alert_sound() -> None:
+    """알림음.
+
+    winsound.Beep 은 '메인보드 비프 스피커' 로 나가는데 요즘 PC엔 그 스피커가
+    없어 아무 소리도 안 나는 경우가 흔하다(실측 확인). 그래서 사운드카드로
+    확실히 나가는 WAV 재생을 쓴다. WAV 를 못 찾으면 MessageBeep 으로 폴백.
     """
     try:
         if os.name == "nt":
             import winsound
-            try:
-                for freq in (1200, 1500, 1200, 1700):
-                    winsound.Beep(freq, 180)
-            except RuntimeError:
-                pass    # 비프 스피커가 없으면 조용히 넘어가고 아래로 폴백
+            path = sound_path(str(SETTINGS.get("sound_file", "")))
+            if path:
+                for _ in range(2):
+                    winsound.PlaySound(path, winsound.SND_FILENAME)
+                return
             for _ in range(3):
                 winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
                 time.sleep(0.18)
@@ -3172,10 +3335,14 @@ def settings_menu() -> None:
             hold = float(SETTINGS.get("banner_hold", 3.0) or 0)
         except (TypeError, ValueError):
             hold = 0.0
+        cur_file = str(SETTINGS.get("sound_file", ""))
+        cur_tone = next((desc for name, desc in SOUND_CHOICES if name == cur_file),
+                        "알람 (기본)")
         items = [
             ("banner", "시작 배너 로고", onoff(SETTINGS.get("banner", True))),
             ("hold", "배너 유지 시간", f"{hold:g}초"),
             ("sound", "알림 소리", onoff(SETTINGS.get("sound", True))),
+            ("tone", "알림음 종류", cur_tone),
             ("test", "알림 소리 테스트", "지금 한 번 울려보기"),
             ("auth", "인증 등록", "준비 중"),
             ("back", "뒤로", ""),
@@ -3194,6 +3361,19 @@ def settings_menu() -> None:
         elif key == "hold":
             SETTINGS["banner_hold"] = ask_int("배너 유지 시간(초)",
                                               int(round(hold)), 0, 10)
+        elif key == "tone":
+            avail = [(n, d) for n, d in SOUND_CHOICES if sound_path(n)]
+            if not avail:
+                print(f"   {C.YELLOW}쓸 수 있는 알림음 파일을 찾지 못했습니다.{C.RESET}")
+                read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
+                continue
+            name, _ = Chooser("알림음 종류", avail,
+                              lambda it: two_col(it[1], it[0], right_width=22),
+                              crumbs=["설정", "알림음"],
+                              hint="고르면 바로 들려줍니다").run()
+            SETTINGS["sound_file"] = name
+            if SETTINGS.get("sound", True):
+                play_alert_sound()
         elif key == "test":
             if SETTINGS.get("sound", True):
                 play_alert_sound()
@@ -3223,9 +3403,9 @@ def show_brand_support(cat: Catalog) -> None:
                              f"{cell(yes if cls.supports_shows else no, 16 + 9)}"
                              f"{yes if cls.supports_seats else no}"))
     lines.append(box_mid())
-    lines.append(box_row(f"{C.DIM}CGV 는 2026년 사이트 개편으로 구 상영표 API 가 모두"
-                         f" 폐기됐고,{C.RESET}"))
-    lines.append(box_row(f"{C.DIM}신규 SPA 의 상영표 엔드포인트는 아직 확보하지 못했습니다."
+    lines.append(box_row(f"{C.DIM}CGV 는 신규 SPA 의 상영표 API 로 잔여석까지 봅니다."
+                         f"{C.RESET}"))
+    lines.append(box_row(f"{C.DIM}좌석표는 예매 인증 뒤에 있어 아직 열지 못했습니다."
                          f"{C.RESET}"))
     lines.append(box_row(f"{C.DIM}메가박스는 좌석선택 화면의 API 로 좌석 단위까지"
                          f" 지원합니다.{C.RESET}"))
@@ -3244,6 +3424,9 @@ def menu_once(cat: Catalog, fav: Favorites) -> bool:
                      else "잔여석이 생기면 알림 (좌석 지정 불가)")
         menu.append(("seat", "좌석 감시", seat_desc))
         menu.append(("open", "예매오픈 감시", "특정 날짜 예매가 열리면 알림"))
+        look = ("회차를 골라 좌석 배치를 바로 확인" if brand.supports_seats
+                else "회차별 잔여석을 바로 확인")
+        menu.append(("look", "좌석 확인", look))
         if profiles:
             menu.append(("saved", "저장된 설정으로 시작", f"{len(profiles)}개 저장됨"))
         menu.append(("radar", "예매 오픈 패턴", "언제 열리는지 측정·기록·예측"))
@@ -3267,6 +3450,9 @@ def menu_once(cat: Catalog, fav: Favorites) -> bool:
         return True
     if picked == "info":
         show_brand_support(cat)
+        return True
+    if picked == "look":
+        browse_seats(cat, fav)
         return True
     if picked == "fav":
         manage_favorites(cat, fav)

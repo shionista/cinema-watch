@@ -441,7 +441,8 @@ class Chooser:
     def __init__(self, title: str, items: list, labeler, crumbs: list[str] | None = None,
                  multi: bool = False, hint: str = "", extra: tuple[str, object] | None = None,
                  preselect: set[int] | None = None, empty_means_all: bool = True,
-                 preview: tuple[str, object] | None = None):
+                 preview: tuple[str, object] | None = None,
+                 preview_label: str = "미리듣기"):
         self.title = title
         self.items = items
         self.labeler = labeler
@@ -450,6 +451,7 @@ class Chooser:
         self.hint = hint
         self.extra = extra              # (표시문구, 반환값) - 목록 맨 아래 추가 항목
         self.preview = preview          # (키, 콜백) - 그 키를 누르면 현재 항목을 미리 실행
+        self.preview_label = preview_label
         self.empty_means_all = empty_means_all
         self.filter = ""
         self.cursor = 0
@@ -519,7 +521,7 @@ class Chooser:
                                  ("m", "처음으로"), ("q", "종료")))
         elif self.preview:
             lines.append(keyhint((glyph("↑↓", "up/dn"), "이동"),
-                                 (self.preview[0], "미리듣기"), ("Enter", "선택"),
+                                 (self.preview[0], self.preview_label), ("Enter", "선택"),
                                  ("m", "처음으로"), ("q", "종료")))
         else:
             lines.append(keyhint((glyph("↑↓", "up/dn"), "이동"), ("Enter", "선택"),
@@ -1566,9 +1568,9 @@ class CgvProvider(Provider):
     color_name = "BRED"
     title = "CGV WATCH"
     site = "cgv.co.kr"
-    supports_seats = False
+    supports_seats = True
     supports_shows = True
-    note = "상영표·잔여석까지 (좌석표는 미제공)"
+    note = "좌석 단위까지 전부 지원"
 
     BASE = "https://cgv.co.kr"
     CO = "A420"
@@ -1651,6 +1653,45 @@ class CgvProvider(Provider):
                 film=str(r.get("movkndDsplNm") or ""),
                 bookable=str(r.get("cntlYn") or "N").upper() != "Y"))
         return out
+
+    def seats(self, show: Show) -> SeatMap:
+        """좌석표. 예매 좌석선택 화면이 쓰는 searchIfSeatData 를 그대로 부른다.
+
+        예매 UI 는 회차를 고르는 순간 로그인을 요구하지만, 이 API 자체는
+        로그인 없이 열린다(토큰 유무로 응답이 같은 것을 확인). custNo 도 없어도 된다.
+        `seatStusCd` 가 "00"(미정)이면 살 수 있는 자리, "01"(예매완료)은 나간 자리.
+        좌표는 xcoordStartVal / ycoordStartVal ("0009" 처럼 4자리 문자열).
+        """
+        url = (f"{self.BASE}/api/v1/booking/searchIfSeatData?coCd={self.CO}"
+               f"&siteNo={show.cinema_id}&scnYmd={show.play_date.replace('-', '')}"
+               f"&scnsNo={show.screen_id}&scnSseq={show.play_seq}"
+               f"&seatAreaNo=001&cusgdCd=01")
+        data = self.http.request(url, referer=f"{self.BASE}/cnm/selectVisitorCnt")
+        sm = SeatMap()
+        for item in (data.get("data") or {}).get("items") or []:
+            for s in item.get("seats") or []:
+                row = str(s.get("seatRowNm") or "").strip().upper()
+                try:
+                    col = int(s.get("seatNo") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not row or not col:
+                    continue
+                ok = (str(s.get("seatStusCd") or "") == "00"
+                      and str(s.get("seatSaleYn") or "Y").upper() == "Y")
+                label = f"{row}{col}"
+                (sm.available if ok else sm.taken).add(label)
+                sm.grid.setdefault(row, []).append((col, ok))
+                try:
+                    sm.coord[label] = (int(s.get("xcoordStartVal")),
+                                       int(s.get("ycoordStartVal")))
+                except (TypeError, ValueError):
+                    pass
+        for row in sm.grid:
+            sm.grid[row].sort()
+        sm.rows = sorted(sm.grid)
+        sm.total = len(sm.available) + len(sm.taken)
+        return sm
 
 
 def unescape_html(text: str) -> str:
@@ -3509,6 +3550,77 @@ def token_expiry(token: str) -> datetime | None:
         return None
 
 
+def check_auth(code: str) -> None:
+    """등록한 인증으로 실제 조회가 되는지 단계별로 확인한다 (인증 화면에서 t)."""
+    if code not in PROVIDERS:
+        return
+    show_cursor()
+    clear_screen()
+    name = PROVIDERS[code].name
+    print("\n".join(header(f"{name} 인증 확인", ["설정", "인증"])))
+
+    entry = (SETTINGS.get("auth") or {}).get(code) or {}
+    token = str(entry.get("token", ""))
+    if not token:
+        print(box_row(f"{C.DIM}{pad('토큰', 10)}{C.RESET}{C.YELLOW}등록 없음{C.RESET}"))
+    else:
+        exp = token_expiry(token)
+        if exp and exp < datetime.now():
+            state = f"{C.BRED}만료됨 ({exp:%m-%d %H:%M}){C.RESET}"
+        elif exp:
+            mins = int((exp - datetime.now()).total_seconds() // 60)
+            state = f"{C.BGREEN}유효{C.RESET}{C.DIM}  만료 {exp:%m-%d %H:%M} ({mins}분 남음){C.RESET}"
+        else:
+            state = f"{C.BGREEN}등록됨{C.RESET}{C.DIM}  (만료 시각이 없는 형식){C.RESET}"
+        print(box_row(f"{C.DIM}{pad('토큰', 10)}{C.RESET}{state}"))
+        print(box_row(f"{C.DIM}{pad('등록시각', 10)}{C.RESET}{C.DIM}"
+                      f"{entry.get('saved', '-')}{C.RESET}"))
+    print(box_mid())
+
+    ok = f"{C.BGREEN}정상{C.RESET}"
+    provider = PROVIDERS[code]()
+    if hasattr(provider, "apply_auth"):
+        provider.apply_auth()
+
+    cinema = show = None
+    try:
+        cinemas = provider.cinemas()
+        cinema = next((c for c in cinemas if c.name == "천호"), cinemas[0] if cinemas else None)
+        print(box_row(f"{C.DIM}{pad('극장목록', 10)}{C.RESET}{ok}"
+                      f"{C.DIM}  {len(cinemas)}개{C.RESET}"))
+    except Exception as exc:
+        print(box_row(f"{C.DIM}{pad('극장목록', 10)}{C.RESET}{C.BRED}실패{C.RESET}"
+                      f"{C.DIM}  {exc}{C.RESET}"))
+
+    if cinema and provider.supports_shows:
+        try:
+            day = date.today().strftime("%Y-%m-%d")
+            shows = [s for s in provider.showtimes(cinema, day) if s.bookable]
+            show = shows[0] if shows else None
+            print(box_row(f"{C.DIM}{pad('상영표', 10)}{C.RESET}{ok}"
+                          f"{C.DIM}  {cinema.name} {len(shows)}회차{C.RESET}"))
+        except Exception as exc:
+            print(box_row(f"{C.DIM}{pad('상영표', 10)}{C.RESET}{C.BRED}실패{C.RESET}"
+                          f"{C.DIM}  {exc}{C.RESET}"))
+
+    if show and provider.supports_seats:
+        try:
+            smap = provider.seats(show)
+            print(box_row(f"{C.DIM}{pad('좌석표', 10)}{C.RESET}{ok}"
+                          f"{C.DIM}  {show.screen_name} {smap.total}석 중 "
+                          f"{len(smap.available)}석 가능{C.RESET}"))
+        except Exception as exc:
+            print(box_row(f"{C.DIM}{pad('좌석표', 10)}{C.RESET}{C.BRED}실패{C.RESET}"
+                          f"{C.DIM}  {exc}{C.RESET}"))
+    print(box_bottom())
+
+    if code == "cgv":
+        print(f"   {C.DIM}CGV 는 조회 API 가 로그인 없이도 열려 있어, 토큰이 없어도"
+              f" 위 항목이 모두 정상일 수 있습니다.{C.RESET}")
+    read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
+    hide_cursor()
+
+
 def auth_menu() -> None:
     """브랜드별 인증 등록. 지금은 CGV 만 인증을 요구한다."""
     while True:
@@ -3532,7 +3644,9 @@ def auth_menu() -> None:
         picked = Chooser("인증 등록", rows,
                          lambda it: two_col(it[1], it[2], right_width=28),
                          crumbs=["설정", "인증"],
-                         hint="CGV 는 좌석 화면에 로그인을 요구합니다").run()
+                         hint="Enter 로 토큰 등록 · t 로 지금 정상인지 확인",
+                         preview=("t", lambda it: check_auth(it[0])),
+                         preview_label="인증 확인").run()
         code = picked[0]
         if code == "back":
             return
@@ -3651,12 +3765,12 @@ def show_brand_support(cat: Catalog) -> None:
                              f"{cell(yes if cls.supports_shows else no, 16 + 9)}"
                              f"{yes if cls.supports_seats else no}"))
     lines.append(box_mid())
-    lines.append(box_row(f"{C.DIM}CGV 는 신규 SPA 의 상영표 API 로 잔여석까지 봅니다."
-                         f"{C.RESET}"))
-    lines.append(box_row(f"{C.DIM}CGV 좌석 화면은 회차를 고르는 순간 로그인을 요구합니다."
-                         f"{C.RESET}"))
-    lines.append(box_row(f"{C.DIM}메가박스는 좌석선택 화면의 API 로 좌석 단위까지"
-                         f" 지원합니다.{C.RESET}"))
+    lines.append(box_row(f"{C.DIM}세 브랜드 모두 예매 좌석선택 화면이 쓰는 API 로"
+                         f" 좌석 단위까지 봅니다.{C.RESET}"))
+    lines.append(box_row(f"{C.DIM}CGV 는 예매 UI 가 로그인을 요구하지만 조회 API 는"
+                         f" 열려 있습니다.{C.RESET}"))
+    lines.append(box_row(f"{C.DIM}모두 조회 전용입니다. 예매·결제·로그인은 하지"
+                         f" 않습니다.{C.RESET}"))
     lines.append(box_bottom())
     print("\n".join(lines))
     read_line(f"   {C.DIM}Enter 를 누르면 계속{C.RESET}")

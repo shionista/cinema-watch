@@ -43,6 +43,7 @@ DEFAULT_SETTINGS = {
     "banner_hold": 3.0,    # 정보성 배너를 몇 초 보여줄지
     "sound": True,         # 알림 소리 전역 스위치
     "sound_file": "",      # 알림음 WAV 파일명 (Windows Media 폴더 기준, 빈 값=기본)
+    "auth": {},            # 브랜드별 인증 {"cgv": {"token": "..."}}
 }
 SETTINGS: dict = dict(DEFAULT_SETTINGS)
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
@@ -1019,26 +1020,35 @@ def seatmap_lines(smap: SeatMap, sweet: set[str] | None = None) -> list[str]:
 
     width = max(col_slot.values()) + 1
 
-    # 칸마다 대표 좌석번호를 정해 머리글 눈금을 만든다 (5의 배수와 1번만 표기).
+    # 칸마다 대표 좌석번호를 정해 눈금을 만든다 (5의 배수와 1번만 표기).
+    # 두 자리 수는 오른쪽 끝을 그 칸에 맞춰 가로로 적는다. 위아래로 쪼개 적으면
+    # 10 이 1 과 0 으로 갈라져 읽히지 않는다.
     by_slot: dict[int, list[int]] = {}
     for _, col, _, lab in labeled:
         by_slot.setdefault(slot_of(lab), []).append(col)
-    tens = [" "] * width
-    ones = [" "] * width
-    for slot, nums in by_slot.items():
-        no = Counter(nums).most_common(1)[0][0]
+    ruler = [" "] * width
+    for slot in sorted(by_slot):
+        no = Counter(by_slot[slot]).most_common(1)[0][0]
         if no != 1 and no % 5:
             continue
         text = str(no)
-        ones[slot] = text[-1]
-        if len(text) > 1:
-            tens[slot] = text[-2]
+        start = max(0, slot - len(text) + 1)
+        if start + len(text) > width:
+            continue
+        if all(ruler[i] == " " for i in range(start, start + len(text))):
+            for i, ch in enumerate(text):
+                ruler[start + i] = ch
 
     pad_left = "     "
     out = []
-    if any(ch != " " for ch in tens):
-        out.append(f"{C.DIM}{pad_left}{''.join(tens)}{C.RESET}")
-    out.append(f"{C.DIM}{pad_left}{''.join(ones)}{C.RESET}")
+    dash = glyph("─", "-")
+    if width >= 12:                       # 좌석 영역 폭에 정확히 맞춘다
+        rest = width - 8
+        out.append(f"{C.DIM}{pad_left}{dash * (rest // 2)} SCREEN "
+                   f"{dash * (rest - rest // 2)}{C.RESET}")
+    else:
+        out.append(f"{C.DIM}{pad_left}{'SCREEN'.center(width)}{C.RESET}")
+    out.append(f"{C.DIM}{pad_left}{''.join(ruler)}{C.RESET}")
 
     prev = None
     for row in smap.rows:
@@ -1056,7 +1066,9 @@ def seatmap_lines(smap: SeatMap, sweet: set[str] | None = None) -> list[str]:
                 cells[slot_of(lab)] = f"{C.BYELLOW}{glyph('◆', '@')}{C.RESET}"
             else:
                 cells[slot_of(lab)] = f"{C.BGREEN}{glyph('■', 'O')}{C.RESET}"
-        out.append(f"{C.BOLD}{row:<2}{C.RESET}   {''.join(cells)}")
+        free = sum(1 for _, ok in smap.grid[row] if ok)
+        tail = f"  {C.BGREEN}{free:>2}{C.RESET}" if free else f"  {C.DIM} -{C.RESET}"
+        out.append(f"{C.BOLD}{row:<2}{C.RESET}   {''.join(cells)}{tail}")
 
     legend = (f"{C.DIM}   {glyph('■', 'O')} 예매가능 {len(smap.available)}석   "
               f"{glyph('·', 'X')} 불가 {len(smap.taken)}석   (숫자=좌석번호){C.RESET}")
@@ -1388,6 +1400,7 @@ class WebJson:
         self.calls = 0
         self._lock = threading.Lock()
         self._last = 0.0
+        self.extra_headers: dict[str, str] = {}   # 인증 헤더 등
         self._jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=ssl.create_default_context()),
@@ -1410,6 +1423,7 @@ class WebJson:
             headers["X-Requested-With"] = "XMLHttpRequest"
         if referer:
             headers["Referer"] = referer
+        headers.update(self.extra_headers)
         req = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST" if data is not None else "GET")
         last: Exception | None = None
@@ -1562,6 +1576,23 @@ class CgvProvider(Provider):
 
     def __init__(self):
         self.http = WebJson()
+        self.apply_auth()
+
+    def apply_auth(self) -> bool:
+        """등록된 accessToken 을 Authorization 헤더로 싣는다.
+
+        CGV 는 쿠키가 아니라 Bearer 토큰을 쓴다(웹 번들에서 확인).
+        좌석 화면은 회차를 고르는 순간 로그인을 요구하므로, 좌석까지 보려면
+        이 토큰이 필요하다.
+        """
+        token = str(((SETTINGS.get("auth") or {}).get(self.code) or {}).get("token", ""))
+        if token:
+            if not token.lower().startswith("bearer "):
+                token = f"Bearer {token}"
+            self.http.extra_headers["Authorization"] = token
+            return True
+        self.http.extra_headers.pop("Authorization", None)
+        return False
 
     @property
     def calls(self) -> int:
@@ -2589,16 +2620,32 @@ def browse_seats(cat: Catalog, fav: Favorites) -> None:
         picked = Chooser(f"{day[5:]} 회차 선택 ({len(shows)}개)", shows, show_label,
                          crumbs + [day[5:]],
                          hint="Enter 로 좌석을 봅니다 · / 로 영화 검색").run()
-        view_one_show(cat, picked, crumbs + [day[5:]])
+        view_one_show(cat, picked, crumbs + [day[5:]], cinema)
         if not ask_yes("다른 회차를 더 볼까요?", True):
             return
 
 
-def view_one_show(cat: Catalog, show: Show, crumbs: list[str]) -> None:
+def view_one_show(cat: Catalog, show: Show, crumbs: list[str], cinema: Cinema) -> None:
     """회차 하나의 좌석표를 그린다. r 로 새로고침."""
     brand = cat.provider
     while True:
         clear_screen()
+        smap = None
+        if brand.supports_seats:
+            print(f"   {C.DIM}좌석표를 불러오는 중 ...{C.RESET}")
+            try:
+                smap = cat.seats(show)
+            except (LotteApiError, Unsupported) as exc:
+                clear_screen()
+                print(f"   {C.BRED}좌석표를 불러오지 못했습니다: {exc}{C.RESET}")
+                read_line(f"   {C.DIM}Enter 로 돌아가기{C.RESET}")
+                return
+            clear_screen()
+
+        # 좌석표를 받았으면 그 수가 지금 값이다(새로고침이 의미를 가지려면 이래야 한다).
+        free = len(smap.available) if smap else show.open_seats
+        total = smap.total if smap and smap.total else show.total_seats
+
         lines = header(f"{show.movie_name}", crumbs)
         lines.append(box_row(f"{C.DIM}{pad('일시', 8)}{C.RESET}{C.BWHITE}"
                              f"{show.play_date} {show.start}~{show.end}{C.RESET}"))
@@ -2606,36 +2653,33 @@ def view_one_show(cat: Catalog, show: Show, crumbs: list[str]) -> None:
                              f"{show.screen_name}{C.RESET}"
                              f"{C.DIM}  {show.film}{C.RESET}"))
         lines.append(box_row(f"{C.DIM}{pad('잔여석', 8)}{C.RESET}"
-                             f"{C.BGREEN}{show.open_seats}{C.RESET}"
-                             f"{C.DIM} / {show.total_seats}석{C.RESET}"))
-        lines.append(box_mid())
+                             f"{C.BGREEN}{free}{C.RESET}"
+                             f"{C.DIM} / {total}석{C.RESET}"
+                             f"{C.DIM}    {datetime.now():%H:%M:%S} 기준{C.RESET}"))
+        lines.append(box_bottom())
         print("\n".join(lines))
 
-        if not brand.supports_seats:
-            print(box_row(f"{C.DIM}{brand.name} 는 좌석표를 제공하지 않아"
-                          f" 잔여석까지만 확인됩니다.{C.RESET}"))
-            print(box_bottom())
-            read_line(f"   {C.DIM}Enter 로 돌아가기{C.RESET}")
-            return
-
-        print(box_bottom())
-        try:
-            smap = cat.seats(show)
-        except (LotteApiError, Unsupported) as exc:
-            print(f"   {C.BRED}좌석표를 불러오지 못했습니다: {exc}{C.RESET}")
-            read_line(f"   {C.DIM}Enter 로 돌아가기{C.RESET}")
-            return
+        if smap is None:
+            print(f"\n   {C.DIM}{brand.name} 는 좌석표를 제공하지 않아"
+                  f" 잔여석까지만 확인됩니다.{C.RESET}")
+            print(keyhint(("r", "새로고침"), ("Enter", "돌아가기")))
+            key = read_key() if UI["tty"] else "enter"
+            if key not in ("char:r", "char:R"):
+                return
+            try:                          # 좌석표가 없으니 상영표를 다시 받아 갱신한다
+                rows = cat.merge_rows(cat.shows(cinema, show.play_date))
+                show = next((s for s in rows if s.key == show.key), show)
+            except (LotteApiError, Unsupported):
+                pass
+            continue
 
         sweet = sweet_seats(smap, 0.2) if smap.coord else set()
         print()
         print("\n".join(seatmap_lines(smap, sweet)))
-        print(f"\n{C.DIM}   스크린 방향은 위쪽입니다. 통로는 빈칸.{C.RESET}")
-        if smap.total and smap.total != show.total_seats:
-            print(f"{C.DIM}   상영표 총석 {show.total_seats} · 좌석표 {smap.total}"
-                  f"{C.RESET}")
         print(keyhint(("r", "새로고침"), ("Enter", "돌아가기")))
+        # read_key 는 글자를 "char:r" 형태로 준다. "r" 로 비교하면 영원히 안 맞는다.
         key = read_key() if UI["tty"] else "enter"
-        if key not in ("r", "R"):
+        if key not in ("char:r", "char:R"):
             return
 
 
@@ -3451,6 +3495,82 @@ def play_alert_sound() -> None:
         pass
 
 
+def token_expiry(token: str) -> datetime | None:
+    """JWT 라면 만료 시각을 꺼낸다. 아니면 None."""
+    try:
+        parts = token.strip().replace("Bearer ", "").split(".")
+        if len(parts) < 2:
+            return None
+        import base64
+        raw = parts[1] + "=" * (-len(parts[1]) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(raw)).get("exp")
+        return datetime.fromtimestamp(int(exp)) if exp else None
+    except Exception:
+        return None
+
+
+def auth_menu() -> None:
+    """브랜드별 인증 등록. 지금은 CGV 만 인증을 요구한다."""
+    while True:
+        auth = SETTINGS.setdefault("auth", {})
+        rows = []
+        for code in ("cgv",):
+            saved = str((auth.get(code) or {}).get("token", ""))
+            if saved:
+                exp = token_expiry(saved)
+                if exp and exp < datetime.now():
+                    state = f"{C.BRED}만료됨 ({exp:%m-%d %H:%M}){C.RESET}"
+                elif exp:
+                    state = f"{C.BGREEN}등록됨{C.RESET} {C.DIM}~{exp:%m-%d %H:%M}{C.RESET}"
+                else:
+                    state = f"{C.BGREEN}등록됨{C.RESET}"
+            else:
+                state = f"{C.DIM}없음{C.RESET}"
+            rows.append((code, PROVIDERS[code].name, state))
+        rows.append(("back", "뒤로", ""))
+
+        picked = Chooser("인증 등록", rows,
+                         lambda it: two_col(it[1], it[2], right_width=28),
+                         crumbs=["설정", "인증"],
+                         hint="CGV 는 좌석 화면에 로그인을 요구합니다").run()
+        code = picked[0]
+        if code == "back":
+            return
+
+        clear_screen()
+        print("\n".join(header(f"{PROVIDERS[code].name} 인증", ["설정", "인증"])))
+        print(box_row(f"{C.DIM}브라우저에서 CGV 에 로그인한 뒤 accessToken 을"
+                      f" 붙여넣으세요.{C.RESET}"))
+        print(box_row(f"{C.DIM}F12 개발자도구 > Application > Local Storage /"
+                      f" Cookies 에서 찾습니다.{C.RESET}"))
+        print(box_row(f"{C.DIM}빈 값을 넣으면 등록이 지워집니다.{C.RESET}"))
+        print(box_bottom())
+        print(f"   {C.YELLOW}이 토큰은 settings.json 에 그대로 저장됩니다."
+              f" 공용 PC 에서는 쓰지 마세요.{C.RESET}")
+        token = ask_text("accessToken").strip()
+
+        if not token:
+            SETTINGS["auth"].pop(code, None)
+            print(f"   {C.DIM}등록을 지웠습니다.{C.RESET}")
+        else:
+            exp = token_expiry(token)
+            SETTINGS["auth"][code] = {"token": token,
+                                      "saved": datetime.now().strftime("%Y-%m-%d %H:%M")}
+            if exp:
+                left = exp - datetime.now()
+                if left.total_seconds() <= 0:
+                    print(f"   {C.BRED}이미 만료된 토큰입니다 ({exp:%m-%d %H:%M}).{C.RESET}")
+                else:
+                    print(f"   {C.BGREEN}등록 완료{C.RESET}"
+                          f"{C.DIM}  만료 {exp:%m-%d %H:%M}"
+                          f" (약 {int(left.total_seconds() // 60)}분 남음){C.RESET}")
+            else:
+                print(f"   {C.BGREEN}등록 완료{C.RESET}"
+                      f"{C.DIM}  (만료 시각을 읽을 수 없는 형식){C.RESET}")
+        save_settings()
+        read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
+
+
 def settings_menu() -> None:
     """전역 환경설정 (settings.json). 배너·알림 소리. 향후 인증 등록 등으로 확장."""
     def onoff(flag: bool) -> str:
@@ -3464,13 +3584,17 @@ def settings_menu() -> None:
         cur_file = str(SETTINGS.get("sound_file", ""))
         cur_tone = next((desc for name, desc in SOUND_CHOICES if name == cur_file),
                         "알람 (기본)")
+        saved_auth = [c for c, v in (SETTINGS.get("auth") or {}).items()
+                      if (v or {}).get("token")]
+        auth_state = (", ".join(PROVIDERS[c].name for c in saved_auth if c in PROVIDERS)
+                      if saved_auth else "등록 없음")
         items = [
             ("banner", "시작 배너 로고", onoff(SETTINGS.get("banner", True))),
             ("hold", "배너 유지 시간", f"{hold:g}초"),
             ("sound", "알림 소리", onoff(SETTINGS.get("sound", True))),
             ("tone", "알림음 종류", cur_tone),
             ("test", "알림 소리 테스트", "지금 한 번 울려보기"),
-            ("auth", "인증 등록", "준비 중"),
+            ("auth", "인증 등록", auth_state),
             ("back", "뒤로", ""),
         ]
         picked = Chooser("설정", items,
@@ -3508,9 +3632,7 @@ def settings_menu() -> None:
                 read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
             continue
         elif key == "auth":
-            print(f"   {C.DIM}인증 등록(로그인 연동)은 다음 버전에서 지원 예정입니다."
-                  f"{C.RESET}")
-            read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
+            auth_menu()
             continue
         save_settings()
 

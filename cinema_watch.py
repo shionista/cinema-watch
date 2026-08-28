@@ -1335,11 +1335,12 @@ class MegaboxProvider(Provider):
     color_name = "BYELLOW"
     title = "MEGABOX WATCH"
     site = "megabox.co.kr"
-    supports_seats = False
-    note = "상영표·잔여석까지 (좌석표는 미제공)"
+    supports_seats = True
+    note = "좌석 단위까지 전부 지원"
 
     BASE = "https://www.megabox.co.kr"
     TIMETABLE = BASE + "/booking/timetable"
+    SEATS = BASE + "/on/oh/ohz/PcntSeatChoi/selectSeatList.do"
 
     def __init__(self):
         self.http = WebJson()
@@ -1405,6 +1406,40 @@ class MegaboxProvider(Provider):
                 film=unescape_html(str(r.get("playKindNm") or "")),
                 bookable=str(r.get("bokdAbleAt") or "Y").upper() == "Y"))
         return out
+
+    def seats(self, show: Show) -> SeatMap:
+        """좌석표. 예매 좌석선택 화면이 쓰는 API 를 그대로 호출한다.
+
+        로그인 없이 열리고, 상영표 warmup(세션 쿠키) 외에 추가 준비가 필요 없다.
+        `seatStatCd` 가 `GERN_SELL` 이면 판매 가능, 그 외(SCT01·SCT04 …)는 나간 자리.
+        실측: 강남 9층 리클라이너 1관 116석 중 72석 가능 = 상영표 잔여석과 일치.
+        """
+        self._ensure()
+        data = self.http.request(self.SEATS,
+                                 {"playSchdlNo": show.play_seq,
+                                  "brchNo": str(show.cinema_id)},
+                                 referer=self.TIMETABLE)
+        sm = SeatMap()
+        for s in data.get("seatListSD01") or []:
+            if str(s.get("seatExpoAt") or "Y").upper() != "Y":
+                continue                      # 화면에 안 그리는 자리(통로 등)
+            row = str(s.get("rowNm") or "").strip().upper()
+            col = int(s.get("seatNo") or 0)
+            if not row or not col:
+                continue
+            ok = str(s.get("seatStatCd") or "") == "GERN_SELL"
+            label = f"{row}{col}"
+            (sm.available if ok else sm.taken).add(label)
+            sm.grid.setdefault(row, []).append((col, ok))
+            x, y = s.get("horzCoorVal"), s.get("vertCoorVal")
+            if x is not None and y is not None:
+                # 롯데와 같은 규칙: X=좌우, Y=스크린에서 멀어지는 방향(A열이 최소)
+                sm.coord[label] = (int(x), int(y))
+        for row in sm.grid:
+            sm.grid[row].sort()
+        sm.rows = sorted(sm.grid)
+        sm.total = len(sm.available) + len(sm.taken)
+        return sm
 
 
 class CgvProvider(Provider):
@@ -3192,8 +3227,8 @@ def show_brand_support(cat: Catalog) -> None:
                          f" 폐기됐고,{C.RESET}"))
     lines.append(box_row(f"{C.DIM}신규 SPA 의 상영표 엔드포인트는 아직 확보하지 못했습니다."
                          f"{C.RESET}"))
-    lines.append(box_row(f"{C.DIM}메가박스는 좌석표가 예매 세션 뒤에 있어 잔여석까지만"
-                         f" 봅니다.{C.RESET}"))
+    lines.append(box_row(f"{C.DIM}메가박스는 좌석선택 화면의 API 로 좌석 단위까지"
+                         f" 지원합니다.{C.RESET}"))
     lines.append(box_bottom())
     print("\n".join(lines))
     read_line(f"   {C.DIM}Enter 를 누르면 계속{C.RESET}")

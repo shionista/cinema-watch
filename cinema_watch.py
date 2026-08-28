@@ -28,7 +28,7 @@ from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 
-VERSION = "0.2"
+VERSION = "0.3"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PROFILE_FILE = os.path.join(APP_DIR, "profiles.json")
 FAVORITE_FILE = os.path.join(APP_DIR, "favorites.json")
@@ -43,7 +43,6 @@ DEFAULT_SETTINGS = {
     "banner_hold": 3.0,    # 정보성 배너를 몇 초 보여줄지
     "sound": True,         # 알림 소리 전역 스위치
     "sound_file": "",      # 알림음 WAV 파일명 (Windows Media 폴더 기준, 빈 값=기본)
-    "auth": {},            # 브랜드별 인증 {"cgv": {"token": "..."}}
 }
 SETTINGS: dict = dict(DEFAULT_SETTINGS)
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
@@ -151,13 +150,14 @@ def cell(text: str, width: int) -> str:
     return pad(trim(text, width), width)
 
 
-def two_col(left: str, right: str, right_width: int = 22) -> str:
+def two_col(left: str, right: str, right_width: int = 22, color: str = "") -> str:
     """목록 한 줄을 '왼쪽 고정폭 + 오른쪽 설명' 두 칸으로 정렬한다.
 
-    왼쪽 값이 길면 잘라내므로 오른쪽 열이 밀리지 않는다.
+    왼쪽 값이 길면 잘라내므로 오른쪽 열이 밀리지 않는다. color 를 주면 왼쪽에
+    입힌다(cell 이 ANSI 를 지우므로 색은 반드시 자른 뒤에 씌워야 한다).
     """
     avail = UI["width"] - 10 - right_width
-    return f"{cell(left, max(avail, 12))}{C.DIM}{right}{C.RESET}"
+    return f"{color}{cell(left, max(avail, 12))}{C.RESET}{C.DIM}{right}{C.RESET}"
 
 
 def starred(left: str, right: str, favorite: bool | None = None,
@@ -1402,7 +1402,6 @@ class WebJson:
         self.calls = 0
         self._lock = threading.Lock()
         self._last = 0.0
-        self.extra_headers: dict[str, str] = {}   # 인증 헤더 등
         self._jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=ssl.create_default_context()),
@@ -1425,7 +1424,6 @@ class WebJson:
             headers["X-Requested-With"] = "XMLHttpRequest"
         if referer:
             headers["Referer"] = referer
-        headers.update(self.extra_headers)
         req = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST" if data is not None else "GET")
         last: Exception | None = None
@@ -1578,23 +1576,6 @@ class CgvProvider(Provider):
 
     def __init__(self):
         self.http = WebJson()
-        self.apply_auth()
-
-    def apply_auth(self) -> bool:
-        """등록된 accessToken 을 Authorization 헤더로 싣는다.
-
-        CGV 는 쿠키가 아니라 Bearer 토큰을 쓴다(웹 번들에서 확인).
-        좌석 화면은 회차를 고르는 순간 로그인을 요구하므로, 좌석까지 보려면
-        이 토큰이 필요하다.
-        """
-        token = str(((SETTINGS.get("auth") or {}).get(self.code) or {}).get("token", ""))
-        if token:
-            if not token.lower().startswith("bearer "):
-                token = f"Bearer {token}"
-            self.http.extra_headers["Authorization"] = token
-            return True
-        self.http.extra_headers.pop("Authorization", None)
-        return False
 
     @property
     def calls(self) -> int:
@@ -3536,155 +3517,6 @@ def play_alert_sound() -> None:
         pass
 
 
-def token_expiry(token: str) -> datetime | None:
-    """JWT 라면 만료 시각을 꺼낸다. 아니면 None."""
-    try:
-        parts = token.strip().replace("Bearer ", "").split(".")
-        if len(parts) < 2:
-            return None
-        import base64
-        raw = parts[1] + "=" * (-len(parts[1]) % 4)
-        exp = json.loads(base64.urlsafe_b64decode(raw)).get("exp")
-        return datetime.fromtimestamp(int(exp)) if exp else None
-    except Exception:
-        return None
-
-
-def check_auth(code: str) -> None:
-    """등록한 인증으로 실제 조회가 되는지 단계별로 확인한다 (인증 화면에서 t)."""
-    if code not in PROVIDERS:
-        return
-    show_cursor()
-    clear_screen()
-    name = PROVIDERS[code].name
-    print("\n".join(header(f"{name} 인증 확인", ["설정", "인증"])))
-
-    entry = (SETTINGS.get("auth") or {}).get(code) or {}
-    token = str(entry.get("token", ""))
-    if not token:
-        print(box_row(f"{C.DIM}{pad('토큰', 10)}{C.RESET}{C.YELLOW}등록 없음{C.RESET}"))
-    else:
-        exp = token_expiry(token)
-        if exp and exp < datetime.now():
-            state = f"{C.BRED}만료됨 ({exp:%m-%d %H:%M}){C.RESET}"
-        elif exp:
-            mins = int((exp - datetime.now()).total_seconds() // 60)
-            state = f"{C.BGREEN}유효{C.RESET}{C.DIM}  만료 {exp:%m-%d %H:%M} ({mins}분 남음){C.RESET}"
-        else:
-            state = f"{C.BGREEN}등록됨{C.RESET}{C.DIM}  (만료 시각이 없는 형식){C.RESET}"
-        print(box_row(f"{C.DIM}{pad('토큰', 10)}{C.RESET}{state}"))
-        print(box_row(f"{C.DIM}{pad('등록시각', 10)}{C.RESET}{C.DIM}"
-                      f"{entry.get('saved', '-')}{C.RESET}"))
-    print(box_mid())
-
-    ok = f"{C.BGREEN}정상{C.RESET}"
-    provider = PROVIDERS[code]()
-    if hasattr(provider, "apply_auth"):
-        provider.apply_auth()
-
-    cinema = show = None
-    try:
-        cinemas = provider.cinemas()
-        cinema = next((c for c in cinemas if c.name == "천호"), cinemas[0] if cinemas else None)
-        print(box_row(f"{C.DIM}{pad('극장목록', 10)}{C.RESET}{ok}"
-                      f"{C.DIM}  {len(cinemas)}개{C.RESET}"))
-    except Exception as exc:
-        print(box_row(f"{C.DIM}{pad('극장목록', 10)}{C.RESET}{C.BRED}실패{C.RESET}"
-                      f"{C.DIM}  {exc}{C.RESET}"))
-
-    if cinema and provider.supports_shows:
-        try:
-            day = date.today().strftime("%Y-%m-%d")
-            shows = [s for s in provider.showtimes(cinema, day) if s.bookable]
-            show = shows[0] if shows else None
-            print(box_row(f"{C.DIM}{pad('상영표', 10)}{C.RESET}{ok}"
-                          f"{C.DIM}  {cinema.name} {len(shows)}회차{C.RESET}"))
-        except Exception as exc:
-            print(box_row(f"{C.DIM}{pad('상영표', 10)}{C.RESET}{C.BRED}실패{C.RESET}"
-                          f"{C.DIM}  {exc}{C.RESET}"))
-
-    if show and provider.supports_seats:
-        try:
-            smap = provider.seats(show)
-            print(box_row(f"{C.DIM}{pad('좌석표', 10)}{C.RESET}{ok}"
-                          f"{C.DIM}  {show.screen_name} {smap.total}석 중 "
-                          f"{len(smap.available)}석 가능{C.RESET}"))
-        except Exception as exc:
-            print(box_row(f"{C.DIM}{pad('좌석표', 10)}{C.RESET}{C.BRED}실패{C.RESET}"
-                          f"{C.DIM}  {exc}{C.RESET}"))
-    print(box_bottom())
-
-    if code == "cgv":
-        print(f"   {C.DIM}CGV 는 조회 API 가 로그인 없이도 열려 있어, 토큰이 없어도"
-              f" 위 항목이 모두 정상일 수 있습니다.{C.RESET}")
-    read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
-    hide_cursor()
-
-
-def auth_menu() -> None:
-    """브랜드별 인증 등록. 지금은 CGV 만 인증을 요구한다."""
-    while True:
-        auth = SETTINGS.setdefault("auth", {})
-        rows = []
-        for code in ("cgv",):
-            saved = str((auth.get(code) or {}).get("token", ""))
-            if saved:
-                exp = token_expiry(saved)
-                if exp and exp < datetime.now():
-                    state = f"{C.BRED}만료됨 ({exp:%m-%d %H:%M}){C.RESET}"
-                elif exp:
-                    state = f"{C.BGREEN}등록됨{C.RESET} {C.DIM}~{exp:%m-%d %H:%M}{C.RESET}"
-                else:
-                    state = f"{C.BGREEN}등록됨{C.RESET}"
-            else:
-                state = f"{C.DIM}없음{C.RESET}"
-            rows.append((code, PROVIDERS[code].name, state))
-        rows.append(("back", "뒤로", ""))
-
-        picked = Chooser("인증 등록", rows,
-                         lambda it: two_col(it[1], it[2], right_width=28),
-                         crumbs=["설정", "인증"],
-                         hint="Enter 로 토큰 등록 · t 로 지금 정상인지 확인",
-                         preview=("t", lambda it: check_auth(it[0])),
-                         preview_label="인증 확인").run()
-        code = picked[0]
-        if code == "back":
-            return
-
-        clear_screen()
-        print("\n".join(header(f"{PROVIDERS[code].name} 인증", ["설정", "인증"])))
-        print(box_row(f"{C.DIM}브라우저에서 CGV 에 로그인한 뒤 accessToken 을"
-                      f" 붙여넣으세요.{C.RESET}"))
-        print(box_row(f"{C.DIM}F12 개발자도구 > Application > Local Storage /"
-                      f" Cookies 에서 찾습니다.{C.RESET}"))
-        print(box_row(f"{C.DIM}빈 값을 넣으면 등록이 지워집니다.{C.RESET}"))
-        print(box_bottom())
-        print(f"   {C.YELLOW}이 토큰은 settings.json 에 그대로 저장됩니다."
-              f" 공용 PC 에서는 쓰지 마세요.{C.RESET}")
-        token = ask_text("accessToken").strip()
-
-        if not token:
-            SETTINGS["auth"].pop(code, None)
-            print(f"   {C.DIM}등록을 지웠습니다.{C.RESET}")
-        else:
-            exp = token_expiry(token)
-            SETTINGS["auth"][code] = {"token": token,
-                                      "saved": datetime.now().strftime("%Y-%m-%d %H:%M")}
-            if exp:
-                left = exp - datetime.now()
-                if left.total_seconds() <= 0:
-                    print(f"   {C.BRED}이미 만료된 토큰입니다 ({exp:%m-%d %H:%M}).{C.RESET}")
-                else:
-                    print(f"   {C.BGREEN}등록 완료{C.RESET}"
-                          f"{C.DIM}  만료 {exp:%m-%d %H:%M}"
-                          f" (약 {int(left.total_seconds() // 60)}분 남음){C.RESET}")
-            else:
-                print(f"   {C.BGREEN}등록 완료{C.RESET}"
-                      f"{C.DIM}  (만료 시각을 읽을 수 없는 형식){C.RESET}")
-        save_settings()
-        read_line(f"   {C.DIM}Enter 로 계속{C.RESET}")
-
-
 def settings_menu() -> None:
     """전역 환경설정 (settings.json). 배너·알림 소리. 향후 인증 등록 등으로 확장."""
     def onoff(flag: bool) -> str:
@@ -3698,21 +3530,16 @@ def settings_menu() -> None:
         cur_file = str(SETTINGS.get("sound_file", ""))
         cur_tone = next((desc for name, desc in SOUND_CHOICES if name == cur_file),
                         "알람 (기본)")
-        saved_auth = [c for c, v in (SETTINGS.get("auth") or {}).items()
-                      if (v or {}).get("token")]
-        auth_state = (", ".join(PROVIDERS[c].name for c in saved_auth if c in PROVIDERS)
-                      if saved_auth else "등록 없음")
         items = [
-            ("banner", "시작 배너 로고", onoff(SETTINGS.get("banner", True))),
-            ("hold", "배너 유지 시간", f"{hold:g}초"),
-            ("sound", "알림 소리", onoff(SETTINGS.get("sound", True))),
-            ("tone", "알림음 종류", cur_tone),
-            ("test", "알림 소리 테스트", "지금 한 번 울려보기"),
-            ("auth", "인증 등록", auth_state),
-            ("back", "뒤로", ""),
+            ("banner", "시작 배너 로고", onoff(SETTINGS.get("banner", True)), ""),
+            ("hold", "배너 유지 시간", f"{hold:g}초", ""),
+            ("sound", "알림 소리", onoff(SETTINGS.get("sound", True)), ""),
+            ("tone", "알림음 종류", cur_tone, ""),
+            ("test", "알림 소리 테스트", "지금 한 번 울려보기", ""),
+            ("back", "뒤로", "", C.BYELLOW),
         ]
         picked = Chooser("설정", items,
-                         lambda it: two_col(it[1], it[2], right_width=26),
+                         lambda it: two_col(it[1], it[2], right_width=26, color=it[3]),
                          crumbs=["설정"],
                          hint="Enter 로 켜고 끄거나 값을 바꿉니다").run()
         key = picked[0]
@@ -3780,28 +3607,32 @@ def menu_once(cat: Catalog, fav: Favorites) -> bool:
     """메뉴 한 번을 처리한다. False 를 돌려주면 프로그램을 끝낸다."""
     brand = cat.provider
     profiles = load_profiles(brand.code)
-    menu: list[tuple[str, str, str]] = []
+    # 색으로 갈래를 나눈다. 감시·확인 같은 본 기능은 밝게, 화면을 떠나는 항목
+    # (종료·전환)은 따로, 설정·즐겨찾기 같은 거들기는 색 없이 흰색으로 둔다.
+    main_c, exit_c, move_c = C.BCYAN, C.BRED, C.BYELLOW
+    menu: list[tuple[str, str, str, str]] = []
     if brand.supports_shows:
         seat_desc = ("원하는 자리가 비면 알림 (취소표)" if brand.supports_seats
                      else "잔여석이 생기면 알림 (좌석 지정 불가)")
-        menu.append(("seat", "좌석 감시", seat_desc))
-        menu.append(("open", "예매오픈 감시", "특정 날짜 예매가 열리면 알림"))
+        menu.append(("seat", "좌석 감시", seat_desc, main_c))
+        menu.append(("open", "예매오픈 감시", "특정 날짜 예매가 열리면 알림", main_c))
         look = ("회차를 골라 좌석 배치를 바로 확인" if brand.supports_seats
                 else "회차별 잔여석을 바로 확인")
-        menu.append(("look", "좌석 확인", look))
+        menu.append(("look", "좌석 확인", look, main_c))
         if profiles:
-            menu.append(("saved", "저장된 설정으로 시작", f"{len(profiles)}개 저장됨"))
-        menu.append(("radar", "예매 오픈 패턴", "언제 열리는지 측정·기록·예측"))
+            menu.append(("saved", "저장된 설정으로 시작", f"{len(profiles)}개 저장됨", main_c))
+        menu.append(("radar", "예매 오픈 패턴", "언제 열리는지 측정·기록·예측", main_c))
     else:
-        menu.append(("info", "지원 현황 보기", f"{brand.name} 는 지점 목록만 확인됩니다"))
+        menu.append(("info", "지원 현황 보기", f"{brand.name} 는 지점 목록만 확인됩니다",
+                     main_c))
     fav_c, fav_s = fav.count(brand.code)
-    menu.append(("fav", "즐겨찾기 관리", f"지점 {fav_c} · 상영관 {fav_s}"))
-    menu.append(("brand", "영화관 변경", "다른 브랜드로 전환"))
-    menu.append(("settings", "설정", "배너 · 알림 소리"))
-    menu.append(("quit", "종료", ""))
+    menu.append(("fav", "즐겨찾기 관리", f"지점 {fav_c} · 상영관 {fav_s}", ""))
+    menu.append(("settings", "설정", "배너 · 알림 소리", ""))
+    menu.append(("brand", "영화관 변경", "다른 브랜드로 전환", move_c))
+    menu.append(("quit", "종료", "", exit_c))
 
     picked = Chooser("무엇을 할까요", menu,
-                     lambda m: two_col(m[1], m[2], right_width=30),
+                     lambda m: two_col(m[1], m[2], right_width=30, color=m[3]),
                      hint="어느 화면에서든 m 을 누르면 이 메뉴로 돌아옵니다").run()[0]
     if picked == "quit":
         return False

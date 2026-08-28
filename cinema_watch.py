@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections import deque
+from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 
@@ -439,7 +439,8 @@ class Chooser:
 
     def __init__(self, title: str, items: list, labeler, crumbs: list[str] | None = None,
                  multi: bool = False, hint: str = "", extra: tuple[str, object] | None = None,
-                 preselect: set[int] | None = None, empty_means_all: bool = True):
+                 preselect: set[int] | None = None, empty_means_all: bool = True,
+                 preview: tuple[str, object] | None = None):
         self.title = title
         self.items = items
         self.labeler = labeler
@@ -447,6 +448,7 @@ class Chooser:
         self.multi = multi
         self.hint = hint
         self.extra = extra              # (표시문구, 반환값) - 목록 맨 아래 추가 항목
+        self.preview = preview          # (키, 콜백) - 그 키를 누르면 현재 항목을 미리 실행
         self.empty_means_all = empty_means_all
         self.filter = ""
         self.cursor = 0
@@ -514,6 +516,10 @@ class Chooser:
             lines.append(keyhint((glyph("↑↓", "up/dn"), "이동"), ("Space", "선택"),
                                  ("a", "전체"), ("Enter", "확인"), ("/", "검색"),
                                  ("m", "처음으로"), ("q", "종료")))
+        elif self.preview:
+            lines.append(keyhint((glyph("↑↓", "up/dn"), "이동"),
+                                 (self.preview[0], "미리듣기"), ("Enter", "선택"),
+                                 ("m", "처음으로"), ("q", "종료")))
         else:
             lines.append(keyhint((glyph("↑↓", "up/dn"), "이동"), ("Enter", "선택"),
                                  ("/", "검색"), ("m", "처음으로"), ("q", "종료")))
@@ -530,6 +536,15 @@ class Chooser:
                 key = read_key()
                 view = self.view()
                 total = len(view) + (1 if self.extra else 0)
+
+                if self.preview:
+                    pkey, action = self.preview
+                    if key == f"char:{pkey}" and total and self.cursor < len(view):
+                        action(self.items[view[self.cursor]])
+                        continue
+                    if key != f"char:{pkey}":
+                        stop_sound()      # 다른 키를 누르면(방향키 포함) 미리듣기 중지
+
                 if key == "up":
                     self.cursor -= 1
                 elif key == "down":
@@ -930,31 +945,119 @@ def find_consecutive(smap: SeatMap, n: int, rows: list[str] | None = None,
     return blocks
 
 
+def axis_slots(values: list[int], aisles: bool = True) -> dict[int, int]:
+    """좌표값 -> 화면 칸 번호. 간격이 벌어진 자리에 통로 한 칸을 넣는다.
+
+    좌석번호는 통로를 알려주지 않는다. 롯데는 번호가 1,2,3… 연속인데 X좌표가
+    1510·2360·4042… 로 띄엄띄엄하고(간격 850 = 좌석 폭, 1682 = 통로 포함),
+    메가박스도 번호 2,3,4 가 위치 2,4,5 에 놓인다. 그래서 좌표로 그려야
+    실제 배치와 맞는다. 간격이 좌석 폭의 1.5배 이상이면 통로로 본다.
+    """
+    uniq = sorted(set(values))
+    if len(uniq) <= 1:
+        return {v: 0 for v in uniq}
+
+    # 같은 열인데 좌표가 몇 픽셀씩 어긋나 있는 경우가 있다(롯데 A열 2360 · B열 2386).
+    # 간격의 중앙값을 좌석 폭으로 보고, 그 절반보다 좁은 차이는 같은 열로 묶는다.
+    gaps = sorted(b - a for a, b in zip(uniq, uniq[1:]))
+    med = gaps[len(gaps) // 2] or 1
+    groups: list[list[int]] = [[uniq[0]]]
+    for prev, v in zip(uniq, uniq[1:]):
+        if v - prev <= med * 0.5:
+            groups[-1].append(v)
+        else:
+            groups.append([v])
+
+    reps = [g[0] for g in groups]
+    if len(reps) <= 1:
+        return {v: 0 for v in uniq}
+    # 좌석 폭은 중앙값으로 잡는다. 최소값을 쓰면 유독 붙은 두 열 하나 때문에
+    # 나머지 정상 간격이 전부 통로로 오인돼 배치가 옆으로 늘어난다(21관).
+    rgaps = sorted(b - a for a, b in zip(reps, reps[1:]))
+    unit = rgaps[len(rgaps) // 2] or 1
+
+    slots: dict[int, int] = {}
+    idx = 0
+    for i, group in enumerate(groups):
+        if i and aisles and (reps[i] - reps[i - 1]) >= unit * 1.5:
+            idx += 1                      # 통로 한 칸
+        for v in group:
+            slots[v] = idx
+        idx += 1
+    return slots
+
+
 def seatmap_lines(smap: SeatMap, sweet: set[str] | None = None) -> list[str]:
-    """좌석 번호에 맞춰 정렬해 그린다 (통로는 빈칸). sweet 를 주면 명당을 따로 표시."""
-    cols = [c for row in smap.rows for c, _ in smap.grid[row]]
-    if not cols:
+    """좌석 배치를 실제 좌표대로 그린다 (통로는 빈칸). sweet 를 주면 명당을 표시."""
+    if not smap.rows:
         return ["(좌석 정보 없음)"]
-    lo, hi = min(cols), max(cols)
-    span = range(lo, hi + 1)
-    tens = "".join(str(c // 10) if c % 5 == 0 and c >= 10 else " " for c in span)
-    ones = "".join(str(c % 10) if c % 5 == 0 else "." for c in span)
-    out = [f"{C.DIM}     {tens}{C.RESET}", f"{C.DIM}     {ones}{C.RESET}"]
+
+    # 좌표가 갖춰져 있으면 좌표로, 아니면 좌석번호로 그린다.
+    labeled = [(row, col, ok, f"{row}{col}")
+               for row in smap.rows for col, ok in smap.grid[row]]
+    use_coord = all(lab in smap.coord for _, _, _, lab in labeled)
+
+    if use_coord:
+        xs = [smap.coord[lab][0] for *_, lab in labeled]
+        col_slot = axis_slots(xs)
+        if max(col_slot.values()) + 1 > UI["width"] - 8:
+            col_slot = axis_slots(xs, aisles=False)   # 너무 넓으면 통로를 접는다
+        def slot_of(lab: str) -> int:
+            return col_slot[smap.coord[lab][0]]
+        # 행은 이미 A·B·C 로 묶여 있으니 행마다 대표 Y 하나만 써야 한다.
+        # 좌석별 Y 를 전부 넣으면 같은 행 안의 미세 오차가 통로로 오인된다.
+        row_y = {row: min(smap.coord[f"{row}{c}"][1] for c, _ in smap.grid[row])
+                 for row in smap.rows}
+        y_slot = axis_slots(list(row_y.values()))
+        rslot = {row: y_slot[y] for row, y in row_y.items()}
+    else:
+        cols = sorted({col for _, col, _, _ in labeled})
+        col_slot = {c: c - min(cols) for c in cols}
+        def slot_of(lab: str) -> int:
+            return col_slot[int(re.sub(r"^[A-Za-z]+", "", lab))]
+        rslot = {row: i for i, row in enumerate(smap.rows)}
+
+    width = max(col_slot.values()) + 1
+
+    # 칸마다 대표 좌석번호를 정해 머리글 눈금을 만든다 (5의 배수와 1번만 표기).
+    by_slot: dict[int, list[int]] = {}
+    for _, col, _, lab in labeled:
+        by_slot.setdefault(slot_of(lab), []).append(col)
+    tens = [" "] * width
+    ones = [" "] * width
+    for slot, nums in by_slot.items():
+        no = Counter(nums).most_common(1)[0][0]
+        if no != 1 and no % 5:
+            continue
+        text = str(no)
+        ones[slot] = text[-1]
+        if len(text) > 1:
+            tens[slot] = text[-2]
+
+    pad_left = "     "
+    out = []
+    if any(ch != " " for ch in tens):
+        out.append(f"{C.DIM}{pad_left}{''.join(tens)}{C.RESET}")
+    out.append(f"{C.DIM}{pad_left}{''.join(ones)}{C.RESET}")
+
+    prev = None
     for row in smap.rows:
-        seats = dict(smap.grid[row])
-        cells = ""
-        for c in span:
-            if c not in seats:
-                cells += " "
-                continue
-            label = f"{row}{c}"
-            if not seats[c]:
-                cells += f"{C.DIM}{glyph('·', 'X')}{C.RESET}"
-            elif sweet and label in sweet:
-                cells += f"{C.BYELLOW}{glyph('◆', '@')}{C.RESET}"
+        here = rslot[row]
+        if prev is not None and here - prev > 1:
+            out.append("")                # 가로 통로
+        prev = here
+
+        cells = [" "] * width
+        for col, ok in smap.grid[row]:
+            lab = f"{row}{col}"
+            if not ok:
+                cells[slot_of(lab)] = f"{C.DIM}{glyph('·', 'X')}{C.RESET}"
+            elif sweet and lab in sweet:
+                cells[slot_of(lab)] = f"{C.BYELLOW}{glyph('◆', '@')}{C.RESET}"
             else:
-                cells += f"{C.BGREEN}{glyph('■', 'O')}{C.RESET}"
-        out.append(f"{C.BOLD}{row:<2}{C.RESET}   {cells}")
+                cells[slot_of(lab)] = f"{C.BGREEN}{glyph('■', 'O')}{C.RESET}"
+        out.append(f"{C.BOLD}{row:<2}{C.RESET}   {''.join(cells)}")
+
     legend = (f"{C.DIM}   {glyph('■', 'O')} 예매가능 {len(smap.available)}석   "
               f"{glyph('·', 'X')} 불가 {len(smap.taken)}석   (숫자=좌석번호){C.RESET}")
     if sweet:
@@ -3298,6 +3401,29 @@ def sound_path(name: str = "") -> str:
     return ""
 
 
+def preview_sound(name: str) -> None:
+    """알림음 미리듣기. 비동기로 틀어 두고 아무 키나 누르면 stop_sound() 로 끊는다."""
+    path = sound_path(name)
+    if not path or os.name != "nt":
+        return
+    try:
+        import winsound
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except Exception:
+        pass
+
+
+def stop_sound() -> None:
+    """재생 중인 미리듣기를 끊는다."""
+    if os.name != "nt":
+        return
+    try:
+        import winsound
+        winsound.PlaySound(None, winsound.SND_PURGE)
+    except Exception:
+        pass
+
+
 def play_alert_sound() -> None:
     """알림음.
 
@@ -3370,10 +3496,10 @@ def settings_menu() -> None:
             name, _ = Chooser("알림음 종류", avail,
                               lambda it: two_col(it[1], it[0], right_width=22),
                               crumbs=["설정", "알림음"],
-                              hint="고르면 바로 들려줍니다").run()
+                              hint="p 로 미리듣기 · 다른 키를 누르면 멈춥니다",
+                              preview=("p", lambda it: preview_sound(it[0]))).run()
+            stop_sound()
             SETTINGS["sound_file"] = name
-            if SETTINGS.get("sound", True):
-                play_alert_sound()
         elif key == "test":
             if SETTINGS.get("sound", True):
                 play_alert_sound()
@@ -3405,7 +3531,7 @@ def show_brand_support(cat: Catalog) -> None:
     lines.append(box_mid())
     lines.append(box_row(f"{C.DIM}CGV 는 신규 SPA 의 상영표 API 로 잔여석까지 봅니다."
                          f"{C.RESET}"))
-    lines.append(box_row(f"{C.DIM}좌석표는 예매 인증 뒤에 있어 아직 열지 못했습니다."
+    lines.append(box_row(f"{C.DIM}CGV 좌석 화면은 회차를 고르는 순간 로그인을 요구합니다."
                          f"{C.RESET}"))
     lines.append(box_row(f"{C.DIM}메가박스는 좌석선택 화면의 API 로 좌석 단위까지"
                          f" 지원합니다.{C.RESET}"))

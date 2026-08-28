@@ -1,0 +1,12 @@
+# 실행 중 생기는 로컬 데이터
+profiles.json
+favorites.json
+history.jsonl
+openlog.jsonl
+settings.json
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+venv/

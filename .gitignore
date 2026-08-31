@@ -1,0 +1,13 @@
+# Runtime data (created while the app runs)
+profiles.json
+favorites.json
+history.jsonl
+openlog.jsonl
+settings.json
+errors.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
